@@ -1,1 +1,1 @@
-Always use Context7 when I need library/API documentation, code generation, setup or configuration steps without me having to explicitly ask.
+当需要库/API 文档、代码生成、环境搭建或配置步骤时，自动调用 Context7，无需用户显式要求。
