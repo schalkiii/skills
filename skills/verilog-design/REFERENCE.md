@@ -718,7 +718,13 @@ $signed({scb_result, {1{1'b0}}})  // INT16 扩展为有符号 32 位
 所有开源 EDA 工具均为 Linux 原生。Windows 下通过 WSL 运行：
 
 ```powershell
-wsl bash -c "make sim"
+# 仿真：先清理缓存/临时文件，再编译运行
+wsl bash -c "make sim-clean && make sim"
+
+# 查看波形（GTKWave 需在 WSL 内安装）
+wsl bash -c "make wave"
+
+# 综合
 wsl bash -c "make synth"
 ```
 
@@ -726,10 +732,32 @@ wsl bash -c "make synth"
 
 ```
 仿真        → Icarus Verilog (iverilog) + vvp
-波形        → Verdi (FSDB) / GTKWave (VCD)
+波形        → GTKWave (VCD) / Verdi (FSDB)
 综合        → Yosys + OpenSTA
 布局布线    → OpenROAD
 逻辑等价性  → Yosys (equiv_*)
+```
+
+#### 标准项目目录结构
+
+```
+project/
+├── Makefile            # 仿真/综合/清理命令
+├── params.vh           # 全局参数定义
+├── rtl/                # RTL 源文件
+│   ├── fifo.v
+│   └── top_module.v
+├── tb/                 # 测试平台
+│   ├── tb_top.v
+│   └── tb_utils.vh
+├── syn/                # 综合输出（gitignore）
+│   └── syn_output.v
+├── sim/                # 仿真输出（gitignore）
+│   ├── simv            # 编译的仿真可执行文件
+│   └── dump.vcd        # 波形文件
+└── scripts/
+    ├── sta.tcl         # 时序分析脚本
+    └── yosys.tcl       # 综合脚本
 ```
 
 ### 7.2 Yosys 综合脚本
@@ -758,22 +786,80 @@ set_output_delay -clock clk 0.5 [all_outputs]
 report_checks
 ```
 
-### 7.4 Makefile 集成
+### 7.4 Makefile 集成（WSL + iverilog）
 
 ```makefile
-VERILOG_SOURCES := $(wildcard rtl/*.v) params.vh
-TESTBENCH := tb/tb_top.v
+# Makefile - Verilog 仿真/综合（WSL + iverilog + Yosys）
+# 使用： powershell 执行 `wsl bash -c "make sim"`
+#       powershell 执行 `wsl bash -c "make sim-clean && make sim"`
 
+# ─── 项目路径 ───────────────────────────────
+RTL_DIR    := rtl
+TB_DIR     := tb
+SIM_DIR    := sim
+VERILOG_SOURCES := $(wildcard $(RTL_DIR)/*.v) params.vh
+TESTBENCH  := $(TB_DIR)/tb_top.v
+SIMV       := $(SIM_DIR)/simv
+WAVE       := $(SIM_DIR)/dump.vcd
+
+# ─── 编译选项 ───────────────────────────────
+VFLAGS     := -g2012 -Wall
+VFLAGS     += -I$(RTL_DIR) -I$(TB_DIR)
+
+# ─── 仿真（依赖清理） ────────────────────────
+.PHONY: sim sim-clean clean wave
+
+sim: $(SIMV)
+	vvp $(SIMV)
+
+$(SIMV): $(VERILOG_SOURCES) $(TESTBENCH) | $(SIM_DIR)
+	iverilog $(VFLAGS) -o $@ $(VERILOG_SOURCES) $(TESTBENCH)
+
+$(SIM_DIR):
+	mkdir -p $@
+
+# ─── 清理 ────────────────────────────────────
+# 清理仿真生成文件：可执行文件、波形、运行时临时文件
+sim-clean:
+	rm -f $(SIMV) $(WAVE) $(SIM_DIR)/*.lxt $(SIM_DIR)/*.lxt2
+	rm -rf $(SIM_DIR)/vvp.tmp $(SIM_DIR)/.vvp_tmp
+
+clean:
+	rm -rf $(SIM_DIR)
+
+# ─── 波形查看 ────────────────────────────────
+wave: $(WAVE)
+	gtkwave $(WAVE)
+
+# ─── 综合 ────────────────────────────────────
 syn: $(VERILOG_SOURCES)
-  yosys -p "read_verilog -sv params.vh rtl/dut.v; hierarchy -top top_module; proc; opt; stat; write_verilog syn_output.v"
+	yosys -p "read_verilog -sv params.vh $(RTL_DIR)/dut.v; \
+	          hierarchy -top top_module; proc; opt; stat; \
+	          write_verilog syn/output.v"
 
-sta: syn_output.v
-  sta sta.tcl
-
-sim: $(VERILOG_SOURCES) $(TESTBENCH)
-  iverilog -g2012 -o simv $(VERILOG_SOURCES) $(TESTBENCH)
-  vvp simv
+sta: syn/output.v
+	sta scripts/sta.tcl
 ```
+
+#### Makefile 使用说明
+
+| 目标 | 命令（WSL 内） | 用途 |
+|------|---------------|------|
+| `sim` | `make sim` | 先编译 `.v` → `simv`，再运行 `vvp` |
+| `sim-clean` | `make sim-clean && make sim` | 清理 `simv` + `*.vcd` + 临时文件再仿真 |
+| `clean` | `make clean` | 删除整个 `sim/` 目录 |
+| `wave` | `make wave` | 用 GTKWave 打开最新波形 |
+| `syn` | `make syn` | Yosys 综合 |
+
+> **为什么不把 `sim-clean` 放在 `sim` 的依赖里？**  
+> 前置清理会**每次都重新编译**（增量编译失效），开发迭代中期频繁改少量代码时应避免。  
+> 需要清理时显式执行 `make sim-clean && make sim`，或脚本中统一加清理。
+>
+> **哪些文件需要清理？**  
+> - `simv` — 编译的仿真可执行文件（iverilog 输出）  
+> - `*.vcd` / `*.lxt` / `*.lxt2` — 波形 dump 文件  
+> - `vvp.tmp` / `.vvp_tmp` — vvp 运行时生成的临时文件  
+> - `*.o` — 如果使用了 C 模型（PLI/VPI 扩展）
 
 ---
 
