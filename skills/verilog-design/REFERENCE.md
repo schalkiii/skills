@@ -108,75 +108,63 @@ module my_module #(
 
 **以物理资源上限为约束，通过模式感知的打包/解包逻辑，在不同模式间动态复用同一组物理资源。**
 
-具体步骤：
+#### 需求矩阵分析（通用流程）
 
-1. **需求矩阵分析**：枚举所有模式下的并行度 × 位宽需求，识别各子系统的峰值需求与闲置区间
-2. **物理资源定上限**：寄存器位宽/运算器数量按各模式的**合理交集**定义，而非最大值的简单笛卡尔积
-3. **打包/解包桥接**：模块间传输紧凑格式节省寄存器，模块内展开全格式便于逐通道处理
-4. **参数化配置**：通过 `parameter/localparam` 定义物理槽位数、位宽、并行度，支持跨配置裁剪
+枚举所有工作模式，按「并行度 × 位宽」构建需求矩阵，识别各子系统的峰值需求与闲置区间：
 
-**案例：混合精度计算引擎（FP16/FP8/NVFP4）**
+| 模式 | 并行度 | 数据位宽 | 总资源需求 |
+|------|--------|----------|-----------|
+| 模式 A（高精度） | N_A | W_A | N_A × W_A |
+| 模式 B（中精度） | N_B | W_B | N_B × W_B |
+| 模式 C（低精度） | N_C | W_C | N_C × W_C |
 
-| 模式 | 并行度 | 尾数位宽 | 总尾数位宽需求 |
-|------|--------|----------|---------------|
-| FP16×FP16 | 16 | 11-bit | 16 × 11 = 176 bit |
-| FP8×FP8 | 32 | 4-bit | 32 × 4 = 128 bit |
-| NVFP4×FP8 | 32 | A:2-bit, B:4-bit | 32 × (2+4) = 192 bit |
+**关键洞察**：若按 max(N) × max(W) 声明物理资源，闲置率可达 40-65%。物理资源应定义为各模式的**合理交集**而非笛卡尔积。
 
-若按最大并行度 × 最大位宽（32 × 11 = 352 bit）声明寄存器，FP8 模式下仅使用 128/352 ≈ 36%，NVFP4 模式下仅使用 192/352 ≈ 55%。
+#### 设计模式一：运算器阵列复用
 
-#### 方法一：运算器阵列复用
+**场景**：多模式运算需求不同，高精度模式需要完整运算器，低精度模式仅需子集。
 
-**通用场景**：多模式下运算需求不同，高精度模式需要完整运算器，低精度模式仅需子集。
-
-**方法**：按各模式用量的**最大值**实例化每种运算器，通过模式感知的输入切片和索引偏移实现跨模式共享。
-
-**案例（乘法器阵列）**：FP16 需要 4×4 + 4×7 + 7×7 三组子乘法器，FP8 仅需 4×4。
+**方法**：按各模式用量的**最大值**实例化每种运算器，通过输入切片和索引偏移实现跨模式共享。
 
 ```
-乘法器实例化策略（按各模式需求的最大值）:
-  P4X4 × 32:  max(FP16=16, FP8=32)     = 32
-  P4X7 × 32:  max(FP16=32)              = 32  (ab项[0:15], ba项[16:31])
-  P7X7 × 16:  max(FP16=16)              = 16  (仅FP16需要)
+实例化策略（逐运算类型求最大值）:
+  Op_Type_A × N:  max(模式A=N_A, 模式B=N_B, ...)  ← 覆盖所有模式
+  Op_Type_B × N:  max(模式A=N_A', 模式B=0, ...)   ← 仅高精度需要
 ```
 
-关键技术点：
+**技术要点**：
 
 | 要点 | 说明 |
 |------|------|
-| **切片感知模式** | FP16 提取 `[10:7]`hi4 + `[6:0]`lo7；FP8 提取 `[3:0]` 全尾数作 hi4，lo7 置零（乘积自然为 0） |
-| **对等信号复用** | ab 项 `hi_a × lo_b` 存于 `[0:15]`，ba 项 `hi_b × lo_a` 存于 `[16:31]`，共享同一组 P4X7 |
-| **旁路替代** | 1-bit 尾数乘法（如 NVFP4）用位移加法替代 (`mant + mant>>1`)，不消耗乘法器 |
+| **切片感知模式** | 高精度模式提取完整数据范围；低精度模式仅提取有效低位，高位填空 |
+| **对等信号复用** | 语义对等的子信号共享同一组运算器，通过索引偏置区分来源 |
+| **旁路替代** | 极低位宽（≤2-bit）运算可用位移加法替代完整乘法器实例化 |
 
-**效果**：乘法器从 96 个（按最大并行度 × 最大位宽全量实例化）降至 80 个，节省 16 个。
+#### 设计模式二：寄存器位宽复用（位拆分存储）
 
-#### 方法二：寄存器位宽复用（位拆分存储）
+**场景**：高精度模式通道少但位宽大，低精度模式通道多但位宽小。按 max(N) × max(W) 声明寄存器导致大量高位闲置。
 
-**通用场景**：高精度模式通道少但位宽大，低精度模式通道多但位宽小。若按最大并行度 × 最大位宽声明寄存器，大量高位闲置。
-
-**方法**：物理寄存器位宽按高精度模式的并行度需求定义，低精度模式下将多个窄位宽数据**打包**存入同一物理槽位。
+**方法**：物理寄存器槽位按高精度模式的并行度 N_high 定义。低精度模式下，将多个窄位宽数据打包存入同一物理槽位。
 
 ```
 物理寄存器结构:
-  PHYS_SLOTS  = 16       (固定槽位数, 对等最大精度模式的通道数)
-  PHYS_MANT_W = 11       (每槽位宽)
-  PHYS_REG_W  = 176      (物理寄存器总位宽 = 16 × 11)
+  PHYS_SLOTS  = N_high    (固定槽位数，等于高精度模式通道数)
+  PHYS_WIDTH  = W_high    (每槽位宽)
+  PHYS_REG_W  = N_high × W_high
 
 映射策略:
-  FP16模式  (16ch): slot[i][10:0] ← ch[i] 尾数                    → 1:1 直接映射
-  FP8模式   (32ch): slot[i][3:0]  ← ch[2i] 尾数, slot[i][7:4]  ← ch[2i+1] 尾数 → 2:1 位拆分
-  NVFP4模式 (32ch): slot[i][1:0]  ← ch[2i] 尾数, slot[i][3:2]  ← ch[2i+1] 尾数 → 2:1 位拆分
+  高精度模式: slot[i][W_high-1:0]  ← ch[i] 数据           → 1:1 直接映射
+  低精度模式: slot[i][W_low-1:0]  ← ch[2i] 数据           → 2:1 位拆分
+              slot[i][2W_low-1:W_low] ← ch[2i+1] 数据      → 两个数据/槽位
 ```
 
 **关键设计模式**：
 
-| 阶段 | 操作 | 位宽 |
+| 阶段 | 操作 | 说明 |
 |------|------|------|
-| **内部处理** | 全格式展开 `MAX_PARALLEL × EXT_MANT_W` | 352 bit（逐通道访问便利） |
-| **打包出口** | 按模式压缩为 `PHYS_REG_W` | 176 bit（节省跨级寄存器） |
-| **解包入口** | 恢复为内部全格式 | 352 bit（下游逐通道处理） |
-
-**效果**：尾数寄存器从 352 bit 降至 176 bit，跨级寄存器面积节省 50%。
+| **内部处理** | 全格式展开为 `max(N) × max(W)` | 方便逐通道遍历，无需位操作 |
+| **打包出口** | 按模式压缩为 `PHYS_REG_W` | 模块间传递紧凑格式，节省跨级寄存器 |
+| **解包入口** | 恢复为内部全格式 | 下游模块按需解包，保持处理逻辑统一 |
 
 #### 方法论原则
 
@@ -631,7 +619,7 @@ $signed({scb_result, {1{1'b0}}})  // INT16 扩展为有符号 32 位
 
 ### 4.5 调试打印方法学
 
-自检测试平台（Self-Checking Testbench）不仅依赖波形分析，更需要结构化的调试打印体系。以下方法学提炼自工业级混合精度点积引擎的 7 个测试模块实践。
+自检测试平台（Self-Checking Testbench）不仅依赖波形分析，更需要结构化的调试打印体系。以下方法学适用于任意 RTL 模块的测试验证。
 
 #### 4.5.1 核心组件
 
@@ -675,18 +663,17 @@ end
 
 ```verilog
 // ── 顶层测试标题 ──
-$display("=== TEST 1: FP16×FP16, 4PE all 1.0*1.0 -> 64.0 ===");
+$display("=== TEST <N>: <操作模式> <输入描述> -> <期望输出> ===");
 
 // ── 子测试分区标题 ──
-$display("--- Directed: FP16xFP16 N=1 ---");
-$display("--- PART 1: NVFP4 Tag Detection (8 encodings) ---");
+$display("--- <分区名>: <描述> ---");
 ```
 
 **命名规范**：
 
 - 顶层测试标题：`=== TEST <N>: <模式> <输入描述> -> <期望输出> ===`
 - 分区标题：`--- <分区名>: <描述> ---`
-- 子测试标题：`<缩写>: <描述>`（如 `D1: FP16 16ch×1.0 N=1`、`RAND FP16xFP16 seed=0`）
+- 子测试标题：`<缩写>: <描述>`（如 `D1: <模式> N=<N>`、`RAND <模式> seed=<seed>`）
 
 #### 4.5.3 结果验证 Task 模式
 
@@ -696,15 +683,15 @@ $display("--- PART 1: NVFP4 Tag Detection (8 encodings) ---");
 
 ```verilog
 task check_result;
-    input [31:0] expected;
+    input [EXPECTED_W-1:0] expected;
     input [255:0] test_name;
     begin
-        if (result_fp32[31:0] === expected) begin
+        if (o_result[EXPECTED_W-1:0] === expected) begin
             pass_count = pass_count + 1;
-            $display("[PASS] %0s: got=0x%08X, expected=0x%08X", test_name, result_fp32, expected);
+            $display("[PASS] %0s: got=0x%08X, expected=0x%08X", test_name, o_result, expected);
         end else begin
             fail_count = fail_count + 1;
-            $display("[FAIL] %0s: got=0x%08X, expected=0x%08X", test_name, result_fp32, expected);
+            $display("[FAIL] %0s: got=0x%08X, expected=0x%08X", test_name, o_result, expected);
         end
     end
 endtask
@@ -713,39 +700,35 @@ endtask
 **关键设计点**：
 - 同时打印实际值和期望值的十六进制表示，方便直接比对 bit pattern
 - `[PASS]`/`[FAIL]` 前缀便于日志 grep 筛选
-- 输入参数支持不同位宽的期望值（`input [31:0]`、`input [MANT_PROD_W-1:0]`）
+- `EXPECTED_W` 声明为 `localparam`，按模块输出位宽设置
 
 ##### 模式 B：Golden Model 比对 Task（中间级验证）
 
 适用于需要软件参考模型计算期望值的场景：
 
 ```verilog
-task check_s2_channel;
-    input [5:0]  ch_idx;
-    input string  test_name;
-    reg [MANT_PROD_W-1:0] golden_mant;
+task check_channel;
+    input [CH_IDX_W-1:0] ch_idx;
+    input string test_name;
+    reg [CH_DATA_W-1:0] golden_data;
     begin
         // 用 golden 函数计算期望值
-        golden_mant = golden_mant_prod(mode, phys_a, phys_b, sub);
+        golden_data = golden_model(mode, input_a, input_b);
         // 逐字段比对
-        if (mant_prod[ch_idx*MANT_PROD_W +: MANT_PROD_W] === golden_mant &&
-            exp_sum[ch_idx*EXP_SUM_W +: EXP_SUM_W] === golden_exp &&
-            sign_prod[ch_idx] === golden_sign) begin
+        if (channel_data[ch_idx*CH_DATA_W +: CH_DATA_W] === golden_data) begin
             pass_count = pass_count + 1;
         end else begin
             fail_count = fail_count + 1;
-            $display("  [FAIL] %0s ch=%0d: mant=%0d(golden=%0d) exp=%0d(golden=%0d) sign=%b(golden=%b)",
+            $display("  [FAIL] %0s ch=%0d: got=%0d(golden=%0d)",
                      test_name, ch_idx,
-                     mant_prod[ch_idx*MANT_PROD_W +: MANT_PROD_W], golden_mant,
-                     exp_sum[ch_idx*EXP_SUM_W +: EXP_SUM_W], golden_exp,
-                     sign_prod[ch_idx], golden_sign);
+                     channel_data[ch_idx*CH_DATA_W +: CH_DATA_W], golden_data);
         end
     end
 endtask
 ```
 
 **关键设计点**：
-- golden （黄金参考）函数与 RTL 逻辑完全对齐，两者独立开发
+- golden（黄金参考）函数与 RTL 逻辑完全对齐，两者独立开发
 - 失败时打印所有差异字段，便于快速定位根因
 - channel 级粒度便于隔离故障通道
 
@@ -755,18 +738,18 @@ endtask
 
 ```verilog
 task check_non_zero;
-    input [2:0]  lane_n;
+    input [LANE_IDX_W-1:0] lane_n;
     input string test_name;
     begin
-        if ($signed(tree_sum[CSW*lane_n +: CSW]) != 0 && local_valid[lane_n] === 1'b1) begin
+        if ($signed(lane_accum[ACCUM_W*lane_n +: ACCUM_W]) != 0 && lane_valid[lane_n] === 1'b1) begin
             pass_count = pass_count + 1;
-            $display("  [PASS] %0s (lane%0d): tree_sum=%0d", test_name, lane_n,
-                     $signed(tree_sum[CSW*lane_n +: CSW]));
+            $display("  [PASS] %0s (lane%0d): accum=%0d", test_name, lane_n,
+                     $signed(lane_accum[ACCUM_W*lane_n +: ACCUM_W]));
         end else begin
             fail_count = fail_count + 1;
-            $display("  [FAIL] %0s (lane%0d): tree_sum=%0d, valid=%b",
+            $display("  [FAIL] %0s (lane%0d): accum=%0d, valid=%b",
                      test_name, lane_n,
-                     $signed(tree_sum[CSW*lane_n +: CSW]), local_valid[lane_n]);
+                     $signed(lane_accum[ACCUM_W*lane_n +: ACCUM_W]), lane_valid[lane_n]);
         end
     end
 endtask
@@ -804,48 +787,49 @@ endtask
 
 ##### 条件触发监控（早期开发阶段）
 
-在开发初期，通过`always @(negedge clk)`加周期范围限制，密集打印关键内部信号：
+在开发初期，通过 `always @(negedge clk)` 加周期范围限制，密集打印关键内部信号：
 
 ```verilog
-// ── 开发调试：前 50 个周期密集监控 ──
+// ── 开发调试：前 N 个周期密集监控 ──
 always @(negedge clk) begin
-    if (cycle > 0 && cycle <= 50) begin
+    if (cycle > 0 && cycle <= CYCLE_MONITOR_LIMIT) begin
         $display("DEBUG cycle=%0d: in_ready=%b in_valid=%b out_valid=%b",
                  cycle, in_ready, in_valid, out_valid);
-        $display("  pe0 pipe_valid=%b pe1 pipe_valid=%b pe2 pipe_valid=%b pe3 pipe_valid=%b",
-                 u_pe_group.pe_inst[0].u_dp.pipe_valid,
-                 u_pe_group.pe_inst[1].u_dp.pipe_valid,
-                 u_pe_group.pe_inst[2].u_dp.pipe_valid,
-                 u_pe_group.pe_inst[3].u_dp.pipe_valid);
+        // 控制信号级联追踪：逐级打印流水线 valid 链
+        $display("  pipe_valid[0]=%b pipe_valid[1]=%b pipe_valid[N-1]=%b",
+                 u_submod[0].pipe_valid,
+                 u_submod[1].pipe_valid,
+                 u_submod[N-1].pipe_valid);
     end
 end
 ```
 
 **使用原则**：
+- `CYCLE_MONITOR_LIMIT` 定义为 `localparam`，通常在 30-100 之间
 - 仅在开发早期启用，正式验证时应注释或移除
 - 通过分层打印组织信号：控制信号 → 数据信号 → 状态标志
-- 使用 DUT 层级路径访问内部信号（`u_pe_group.pe_inst[0].u_dp.pipe_valid`）
+- 使用 DUT 层级路径访问内部信号（`u_submod[0].pipeline_stage`）
 
 ##### 内联调试打印（定向测试中）
 
 在定向测试 Task 内部直接插入调试打印：
 
 ```verilog
-$display("    [S1-debug] nvfp4=0x%h exp_eff_a[ch0]=%0d ext_mant_a[slot0]=11'b%011b",
-         nvfp4_code,
-         exp_eff_a[0 +: EXP_EFF_W],
-         ext_mant_a[0 +: EXT_MANT_W]);
+$display("    [<模块名>-debug] mode=0x%h ch0_data=%0d slot0_raw=%b",
+         mode_code,
+         channel_data[0 +: CH_DATA_W],
+         slot_raw[0 +: SLOT_W]);
 ```
 
-**命名约定**：`[模块名-debug]` 前缀，便于 grep 筛选和事后清理。
+**命名约定**：`[<模块名>-debug]` 前缀，便于 grep 筛选和事后清理。
 
 #### 4.5.6 随机测试打印规范
 
 随机测试需要记录种子值以便复现：
 
 ```verilog
-$display("  [PASS] RAND %0s seed=%0d (lane%0d): tree_sum=%0d, max_exp=%0d",
-         mode_name, seed, lane_n, $signed(tree_sum), golden_max);
+$display("  [PASS] RAND %0s seed=%0d (lane%0d): result=%0d",
+         mode_name, seed, lane_n, $signed(lane_result));
 ```
 
 - 失败时**必须打印种子值**，否则无法复现
@@ -897,38 +881,38 @@ end
   check_* task 内部可省略 PASS 打印（仅打印 FAIL）
 ```
 
-#### 4.5.10 实战案例：混合精度点积引擎验证体系
+#### 4.5.10 测试验证框架模板
 
-以下数据来自 `dot_product_pipeline` 项目 7 个测试模块的实际验证结果。
+##### 测试模块层级结构
 
-##### 测试模块清单
+一个完整的 RTL 模块验证体系应包含以下层次：
 
-| 模块 | 测试类型 | 覆盖范围 | 打印模式 |
-|------|---------|---------|---------|
-| `tb_pe_group` | 定向 + 随机 | PE 级联流水线全路径 | 模式 A + B + C |
-| `tb_dot_product_pipeline` | 端到端 | 4PE × 多模式，含级联 | 模式 A + 超时 |
-| `tb_s1_spv_format_expand` | 中间级 + 随机 | 7 种格式展开，golden 比对 | 模式 B |
-| `tb_s2_multiplier_array` | 中间级 + 随机 | 288 atom 乘法器阵列 | 模式 B |
-| `tb_s3_align_adder_normalize` | 中间级 | 对齐加法归一化流水线 | 模式 B |
-| `tb_s4_cascade_accum` | 中间级 | 级联累加 + overflow 检测 | 模式 A + C |
-| `tb_nvfp4` | 格式专项 | NVFP4 8 种编码检测 | 模式 B |
+| 层级 | 测试目标 | 验证方法 | 推荐打印模式 |
+|------|---------|---------|-------------|
+| **端到端** | 完整流水线全路径 | 定向 + 随机输入，DUT 输出 vs 期望值 | 模式 A（通用比对）+ 超时保护 |
+| **中间级 1** | 流水线前级（格式解析/展开） | 随机输入，golden model 逐项比对 | 模式 B（Golden Model） |
+| **中间级 2** | 流水线中段（运算阵列） | 随机输入，子字段黄金参考比对 | 模式 B |
+| **中间级 3** | 流水线后级（累加/归一化） | 定向 + 边界条件覆盖 | 模式 A + C |
+| **格式专项** | 特定数据格式编解码逻辑 | 枚举所有编码组合，逐项验证 | 模式 B |
 
-##### 验证覆盖率
+##### 验证覆盖维度
 
-| 维度 | 覆盖率 | 说明 |
-|------|--------|------|
-| 运算模式 | 7/7 (100%) | FP16×FP16, INT8×INT8, FP8×FP16, FP8×FP8, NVFP4×FP16, NVFP4×FP8, NVFP4×NVFP4 |
-| 通道组合 | 4/8/16/32 | 覆盖 N=1/2/4 正交组合 |
-| 级联路径 | 已覆盖 | cascade_in/out 跨 PE 传播 |
-| 边界条件 | 已覆盖 | subnormal、零值、溢出、最大/最小指数 |
-| 随机种子 | 多组 | 每个模式的定向测试后附加随机回测 |
+| 维度 | 覆盖要求 | 说明 |
+|------|---------|------|
+| **操作模式** | 100% | 所有模式组合（高×高、高×低、低×低等） |
+| **通道组合** | 主流值 | 最小/中值/最大并行度，含跨边界值 |
+| **级联路径** | 已覆盖 | 级联输入/输出传播路径 |
+| **边界条件** | 全部 | subnormal、零值、溢出、最大/最小指数 |
+| **随机种子** | 多组 | 每个模式的定向测试后附加随机回测 |
 
 ##### 打印日志量管理策略
 
-- **开发期**：`[DBG]` 前缀 + `always @(negedge clk)` 条件监控，限制 cycle ≤ 50
-- **验证期**：仅 `[PASS]`/`[FAIL]` 打印，`[DBG]` 全部注释
-- **回归期**：`[PASS]` 聚合为计数，仅 `[FAIL]` 详细打印
-- **定位技巧**：`grep FAIL build/sim_*.txt` 一键汇总所有失败项
+| 阶段 | 打印级别 | 具体做法 |
+|------|---------|---------|
+| **开发期** | 详细 | `[DBG]` 前缀 + `always @(negedge clk)` 条件监控，限制 cycle ≤ 50 |
+| **验证期** | 精简 | 仅 `[PASS]`/`[FAIL]` 打印，`[DBG]` 全部注释 |
+| **回归期** | 聚合 | `[PASS]` 聚合为计数，仅 `[FAIL]` 详细打印 |
+| **定位技巧** | 筛选 | `grep FAIL build/sim_*.txt` 一键汇总所有失败项 |
 
 ---
 
@@ -1319,10 +1303,10 @@ write_verilog -noattr build/dut_syn.v
 # WSL 环境
 yosys syn.ys
 
-# 完整综合流程（含 SDC 约束注入）
+# 完整综合流程（SDC 约束通过命令行注入）
 yosys -p "
   read_verilog -sv params.vh rtl/*.v;
-  hierarchy -check -top dot_product_pipeline;
+  hierarchy -check -top <top_module>;
   proc; opt; fsm; opt;
   techmap; opt;
   abc -liberty \$LIBERTY;
@@ -1523,12 +1507,15 @@ set_false_path -from [get_pins sync_r1_reg/Q] -to [get_pins sync_r2_reg/D]
 
 ```bash
 #!/bin/bash
-# check_all.sh — 完整设计检查流程
-PROJECT_ROOT="/mnt/d/workspace/mixed_precision_dot_product"
+# check_all.sh — 完整设计检查流程（通用模板，按项目修改路径）
+PROJECT_ROOT="<project_root>"
 RTL_DIR="$PROJECT_ROOT/rtl"
 TB_DIR="$PROJECT_ROOT/tb"
 BUILD_DIR="$PROJECT_ROOT/build"
 SDC_FILE="$PROJECT_ROOT/constraints/constraints.sdc"
+
+TOP_MODULE="<top_module>"
+TB_TOP="<tb_top_module>"
 
 mkdir -p "$BUILD_DIR"
 
@@ -1541,15 +1528,15 @@ echo "=== [2/4] Simulation ==="
 cd "$TB_DIR"
 iverilog -g2012 -o "$BUILD_DIR/simv" \
   "$RTL_DIR"/*.v \
-  tb_dot_product_pipeline.v
+  "$TB_DIR/$TB_TOP.v"
 vvp "$BUILD_DIR/simv" | tee "$BUILD_DIR/sim_output.txt"
 
 # ── Step 3: Yosys 综合 ──
 echo "=== [3/4] Yosys Synthesis ==="
 yosys -p "
-  read_verilog -sv $RTL_DIR/params.vh;
+  read_verilog -sv $RTL_DIR/params.vh 2>/dev/null;   # 可选参数文件
   read_verilog $RTL_DIR/*.v;
-  hierarchy -check -top dot_product_pipeline;
+  hierarchy -check -top $TOP_MODULE;
   proc; opt; fsm; opt;
   techmap; opt;
   stat -width;
@@ -1559,10 +1546,10 @@ yosys -p "
 # ── Step 4: OpenSTA 时序分析 ──
 echo "=== [4/4] OpenSTA Timing ==="
 if command -v sta &> /dev/null; then
-  sta -no_splash -exit build/sta_report.txt <<EOF
+  sta -no_splash -exit <<EOF
 read_liberty \$::env(LIBERTY_FILE)
 read_verilog $BUILD_DIR/dut_syn.v
-link_design dot_product_pipeline
+link_design $TOP_MODULE
 read_sdc $SDC_FILE
 report_checks -path_delay max -slack_lesser_than 0.0
 report_tns
@@ -1593,42 +1580,31 @@ echo "          $BUILD_DIR/sta_report.txt"
 | STA | 时序收敛 | WNS ≥ 0, TNS = 0 | OpenSTA |
 | CDC | 跨时钟域 | 所有异步信号已同步，约束完整 | 人工 + SDC |
 
-#### 7.5.9 Verible Lint 实战分类统计
+#### 7.5.9 Verible Lint 规则分类与修复优先级
 
-以下数据来自 `dot_product_pipeline` 项目 7 个 RTL 文件的 Verible 全规则集检查结果（381 条警告）：
+Verible 全规则集检查会产生多种类型的警告，以下按严重级别分类：
 
-| 规则 | 数量 | 严重级别 | 根因 |
-|------|------|---------|------|
-| `port-name-suffix` | 99 | Style | 端口未遵循 `_i/_o` 命名后缀 |
-| `line-length` | 95 | Style | 行宽超过 100 字符 |
-| `explicit-parameter-storage-type` | 80 | Style | `parameter` 未显式声明存储类型 |
-| `explicit-begin` | 39 | Style | `if/for` 后缺少显式 `begin/end` |
-| `unpacked-dimensions-range-ordering` | 26 | Style | 数组维度声明顺序 `[0:N-1]` → 应为 `[N]` |
-| `generate-constructs` (legacy) | 18 | Style | 使用了非 genvar 的旧式 generate |
-| `instance-shadowing` | 10 | Style | 实例名与外层同名 |
-| `always-comb` | 9 | Style | `always @*` → 应为 `always_comb` |
-| `legacy-genvar-declaration` | 9 | Style | `genvar` 在 generate 块外声明 |
-| `legacy-generate-region` | 7 | Style | 遗留 generate region 写法 |
-| `case-missing-default` | 2 | Warning | case 缺少 default 分支 |
-| 其他 | 7 | Style | EOF、trailing spaces 等 |
+| 规则类别 | 典型规则 | 严重级别 | 根因 |
+|---------|---------|---------|------|
+| **Naming** | `port-name-suffix`、`signal-name-style` | Style | 端口/信号名未遵循命名约定 |
+| **Formatting** | `line-length`、`explicit-begin`、`indentation` | Style | 代码格式不符合规范 |
+| **Declaration** | `explicit-parameter-storage-type`、`unpacked-dimensions-range-ordering` | Style | 声明未遵循最佳实践 |
+| **Legacy syntax** | `generate-constructs`、`legacy-genvar-declaration`、`legacy-generate-region` | Style | 使用被 SystemVerilog 淘汰的旧语法 |
+| **Semantic** | `always-comb`、`instance-shadowing` | Style/Warning | `always @*` → `always_comb`、实例名冲突 |
+| **Correctness** | `case-missing-default`、`port-width-mismatch` | Warning | 潜在功能逻辑风险 |
 
 ##### 按修复优先级分类
 
-| 优先级 | 规则 | 数量 | 理由 |
-|--------|------|------|------|
-| **P0（立即）** | `case-missing-default` | 2 | 潜在推断 latch 风险 |
-| **P1（尽快）** | `always-comb` | 9 | 仿真-综合不一致风险 |
-| | `instance-shadowing` | 10 | 层次路径混淆 |
-| **P2（计划）** | `generate-constructs` | 18 | 旧语法可能不被后续工具支持 |
-| | `packed-dimensions-range-ordering` | 26 | 编码规范对齐 |
-| **P3（可选）** | `port-name-suffix` | 99 | 仅影响风格一致性 |
-| | `line-length` | 95 | 不影响功能 |
-| | `explicit-parameter-storage-type` | 80 | 不影响功能 |
-| | `explicit-begin` | 39 | 不影响功能 |
+| 优先级 | 类别 | 理由 |
+|--------|------|------|
+| **P0（立即）** | Correctness（0 Warning） | 潜在推断 latch、功能错误风险 |
+| **P1（尽快）** | Semantic（收敛至 ≤30%） | 仿真-综合不一致风险、层次路径混淆 |
+| **P2（计划）** | Legacy syntax、Declaration | 旧语法可能不被后续工具支持 |
+| **P3（可选）** | Naming、Formatting | 仅影响风格一致性，不影响功能 |
 
 ##### Lint 通过标准
 
-- **硬标准**：P0 类问题 = 0；P1 类问题 < 原始数量的 30%
+- **硬标准**：P0 类问题 = 0；P1 类问题 ≤ 原始数量的 30%
 - **软标准**：P2 类问题可纳入技术债跟踪，逐版本收敛
 - **豁免标准**：P3 类问题在团队风格规范明确前可保留
 
@@ -1640,7 +1616,7 @@ echo "          $BUILD_DIR/sta_report.txt"
 
 - **现象**：Yosys 在 `read_verilog` / `hierarchy` 阶段超时（60s+），WSL pty 崩溃（`灾难性故障 E_UNEXPECTED`）
 - **根因**：WSL 默认使用一半物理内存，大型 always 组合块生成的 RTLIL 网表对象数超标
-- **影响阈值**：以 s2_multiplier_array 为例 — 32 通道 × 288 atom × 多模式展开 ≈ 数百万逻辑对象
+- **影响阈值**：大规模展开的 always 组合块（如 multi-channel 运算阵列、多级嵌套 generate 块）生成的 RTLIL 网表对象数可能超标
 
 ##### 解决方案矩阵
 
@@ -1701,25 +1677,24 @@ end
 **修复后（可综合）**：
 ```verilog
 // 定义编译期常量作为最大边界
-localparam MAX_PARALLEL = 32;
+localparam MAX_N = 32;  // 最大通道数/元素数
 
 // 使用常量边界 → 工具在编译期确定迭代次数
-for (ch = 0; ch < MAX_PARALLEL; ch = ch + 1) begin
-    if (ch < active) begin  // 运行时条件：仅活跃通道执行
-        ext_mant_a[EXT_MANT_W*ch +: EXT_MANT_W] = ...;
+for (ch = 0; ch < MAX_N; ch = ch + 1) begin
+    if (ch < active_n) begin  // 运行时条件：仅活跃元素执行
+        channel_data[CH_W*ch +: CH_W] = ...;
     end
 end
 ```
 
-##### 本项目修复清单
+##### 典型修复清单（参考模板）
 
-| 文件 | 修复位置 | 变量边界 | 替换为 | 修复行数 |
-|------|---------|---------|--------|---------|
-| `s1_spv_format_expand.v` | channel 遍历 | `active` | `MAX_PARALLEL` + `if (ch < active)` | 1 |
-| `s3_align_adder_normalize.v` | max_exponent 扫描 ×2 | `active_parallel` | `MAX_PARALLEL` + `if (ch < active_parallel)` | 2 |
-| `s2_multiplier_array.v` | n_position 遍历 | `N_lane` | `MAX_N` + `if (n_position < N_lane)` | 1 |
-| `s2_multiplier_array.v` | 高通道清零 | `K_LANES * N_lane` (start) | `0` + `if (ch >= K_LANES * N_lane)` | 1 |
-| `s2_multiplier_array.v` | a_slice/b_slice 遍历 | `fn_a_slices`/`fn_b_slices` | `MAX_A_SLICES`/`MAX_B_SLICES` + 条件 | 4 |
+| 修复位置 | 变量边界 | 替换为 | 改动量 |
+|---------|---------|--------|-------|
+| 通道遍历循环 | `active`（运行时变量） | `MAX_N` + `if (ch < active)` | 1 行 |
+| 多维索引遍历 | `n_active`（运行时变量） | `MAX_M` + `if (n < n_active)` | 1 行 |
+| 数据清零/初始化 | `K * n_active`（运行时起始） | `0` + `if (ch >= K * n_active)` | 1 行 |
+| 切片组合遍历 | `fn_a`/`fn_b`（运行时变量） | `MAX_A`/`MAX_B` + 条件分支 | 2-4 行 |
 
 ##### 设计规则
 
@@ -1730,34 +1705,36 @@ end
 ##### 警告特征
 
 ```
-Warning: Range select [694:693] out of bounds on signal `\ext_mant_a_unpacked':
-Setting all 2 result bits to undef.
+Warning: Range select [N:M] out of bounds on signal `\<signal_name>':
+Setting all (N-M+1) result bits to undef.
 ```
 
 ##### 诊断三步法
 
 **Step 1: 定位**。识别警告涉及的信号和越界偏移量：
-- 信号名：`ext_mant_a_unpacked`
-- 越界范围：`[694:693]`
-- 信号声明位宽：`[EXT_MANT_W * MAX_PARALLEL - 1:0]` = `[351:0]`
+- 信号名：报告中的信号全路径名
+- 越界范围：`[N:M]`
+- 信号声明位宽：`[W_MAX - 1:0]`（记下最大值）
 
 **Step 2: 分析**。追踪越界访问的生成逻辑：
-```verilog
-// NVFP4_FP16 模式下，slot=15 时的展开偏移
-ext_mant_a_unpacked[EXT_MANT_W*(4*slot+3) +: 2]  // → [694:693]
-// EXT_MANT_W=11, slot=15 → 11*(60+3)+1 = 694
+
 ```
-根因：NVFP4 展开率 4×（每个物理槽位包含 4 个逻辑元素），但 `ext_mant_a_unpacked` 的位宽仅按 `物理槽位数 × 尾数宽` 分配，未考虑最大展开倍数。
+越界访问通常源于以下模式：
+  1. 展开比率估算不足：索引公式中乘了展开因子（如 4×、8×）
+     但信号位宽未同步放大
+  2. 条件分支生成的访问路径：某些 mode 下索引偏移超出声明范围
+  3. 参数化表达式中边界计算错误
+```
 
 **Step 3: 修复**。重新计算所需位宽：
 ```verilog
 // 修复前
-wire [EXT_MANT_W * MAX_PARALLEL - 1:0] ext_mant_a_unpacked; // 352 bits
+wire [W_MAX - 1:0] unpacked_data;           // 未考虑展开率
 
-// 修复后：考虑最大展开率
-localparam MAX_UNPACK_RATIO = 4;  // NVFP4 最多 4 个元素/槽位
-wire [EXT_MANT_W * MAX_PARALLEL * MAX_UNPACK_RATIO / 2 - 1:0]
-     ext_mant_a_unpacked;          // 704 bits
+// 修复后：将展开率纳入位宽计算
+localparam UNPACK_RATIO = 4;                 // 最大展开倍数
+wire [W_MAX * UNPACK_RATIO - 1:0]
+     unpacked_data;                           // 位宽 × 展开率
 ```
 
 ##### 通用诊断原则
@@ -1773,17 +1750,49 @@ wire [EXT_MANT_W * MAX_PARALLEL * MAX_UNPACK_RATIO / 2 - 1:0]
 
 ## Phase 8: AI 波形调试工作流
 
-### 8.1 debug_waveform.py — `--watch` 万能入口
+### 8.1 debug_waveform.py — 零依赖 VCD 分析工具
 
-零依赖 VCD 分析工具。所有模式输出结构化 JSON。
+本目录下的 `debug_waveform.py` 是专为 AI 代理设计的 VCD 波形分析器，无需安装任何额外 Python 包（仅使用标准库）。所有命令输出结构化 JSON，便于程序化解析。
 
-| 用法 | 模式 | 用途 |
-|-------|------|------|
-| `--watch` | 自动发现快照 | 仿真结束时 dump 端口 + 内部信号全状态 |
-| `--watch <信号> --time <ps>` | 定向快照 | 指定时刻特定信号值 |
-| `--watch <信号> --time T1-T2` | 时间窗口 | 窗口内所有信号变化追踪 |
-| `--watch <信号> --trigger <沿> -n N` | 触发序列 | 按触发沿筛选的时序追踪 |
-| `--list-signals [--pattern <pat>]` | 信号发现 | 列出信号层级，可选筛选 |
+#### 快速上手
+
+```bash
+# 1. 运行仿真，生成 VCD 波形文件
+iverilog -o simv rtl/*.v tb/*.v && vvp simv
+
+# 2. 自动发现快照（调试起点）
+python3 debug_waveform.py --vcd dump.vcd --watch
+
+# 3. 列出所有信号（定位目标）
+python3 debug_waveform.py --vcd dump.vcd --list-signals
+
+# 4. 定向快照 + 时序追踪（深入排查）
+python3 debug_waveform.py --vcd dump.vcd --watch result valid --time 95000 --json
+python3 debug_waveform.py --vcd dump.vcd --watch result --trigger valid -n 20
+```
+
+#### 命令参考
+
+| 用法 | 场景 | 典型输出 |
+|------|------|---------|
+| `--watch` | 自动发现快照（仿真结束时刻） | 全部信号的当前值 |
+| `--watch <sig1> <sig2> --time <ps>` | 指定时刻的定向快照 | 指定信号的定点值 |
+| `--watch <sig> --time T1-T2` | 时间窗口内信号变化追踪 | 窗口内所有变化的时间线 |
+| `--watch <sig> --trigger <沿> -n N` | 触发沿时序追踪 | 触发后 N 次变化序列 |
+| `--list-signals` | 列出 VCD 中所有信号及层级路径 | 信号名列表（含层级） |
+| `--list-signals --pattern <kw>` | 按关键词筛选信号 | 匹配的信号名列表 |
+
+#### 调试场景速查
+
+| 场景 | 推荐命令 | 说明 |
+|------|---------|------|
+| 仿真结束时检查全部输出 | `--watch` | 自动发现模式，无需指定时间和信号 |
+| 怀疑某时刻结果错误 | `--watch <信号> --time <ps>` | 查看该时刻的具体值 |
+| 信号异常跳变追踪 | `--watch <sig> --trigger posedge -n 10` | 捕获触发后的变化序列 |
+| 窗口内行为分析 | `--watch <sig> --time T1-T2` | 查看窗口内的所有变化 |
+| 信号名不记得 | `--list-signals --pattern <关键词>` | 搜索信号层级和名称 |
+| 多信号同时监控 | `--watch sig_a sig_b --time <ps>` | 空格分隔多信号 |
+| 子模块内部定位 | `--watch u_submod/* --time <窗口>` | 聚焦子模块信号群 |
 
 ### 8.2 AI 信号选择原则
 
