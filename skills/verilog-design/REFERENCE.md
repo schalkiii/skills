@@ -629,6 +629,307 @@ $signed({scb_result, {1{1'b0}}})  // INT16 扩展为有符号 32 位
 | **边界值** | 最大值、最小值、零、溢出/下溢 | FP16 的 INF/NaN、有符号 INT16 的 -32768 |
 | **随机测试** | 大量随机输入交叉验证（DUT vs 参考模型） | `$urandom(seed)` 生成千级测试 |
 
+### 4.5 调试打印方法学
+
+自检测试平台（Self-Checking Testbench）不仅依赖波形分析，更需要结构化的调试打印体系。以下方法学提炼自工业级混合精度点积引擎的 7 个测试模块实践。
+
+#### 4.5.1 核心组件
+
+每个测试模块应包含以下标准组件：
+
+| 组件 | 类型 | 说明 |
+|------|------|------|
+| `pass_count` / `fail_count` | `integer` | 全局通过/失败计数器，仿真结束时输出汇总 |
+| `cycle` (可选) | `integer` | 周期计数器，用于调试打印的时间戳标注 |
+| `wait_timeout` | `integer` | 超时等待计数器，防止仿真死锁 |
+| `check_*` task(s) | `task` | 结果验证任务，自动比对期望值与实际输出 |
+| `fill_*` function(s) | `function` | 输入填充函数，快速构造不同格式的测试向量 |
+| `init_*` / `set_*` task(s) | `task` | 初始化/设置任务，统一管理信号赋值 |
+
+```verilog
+// ── 标准声明模板 ──
+integer pass_count;
+integer fail_count;
+integer wait_timeout;
+
+// ── 周期计数器（需要时）──
+integer cycle;
+always @(posedge clk) begin
+    cycle = cycle + 1;
+end
+```
+
+#### 4.5.2 测试组织结构
+
+采用**分层测试结构**，清晰区分测试阶段：
+
+```
+=== TEST N: <描述> ===        ← 测试标题横幅
+[DBG] time=<时间戳>            ← 可选的调试信息
+  [PASS] <test_name>          ← 成功项
+  [FAIL] <test_name>          ← 失败项（含期望值 vs 实际值）
+=== Summary: Pass=X, Fail=Y === ← 测试汇总
+```
+
+**标题横幅格式**：
+
+```verilog
+// ── 顶层测试标题 ──
+$display("=== TEST 1: FP16×FP16, 4PE all 1.0*1.0 -> 64.0 ===");
+
+// ── 子测试分区标题 ──
+$display("--- Directed: FP16xFP16 N=1 ---");
+$display("--- PART 1: NVFP4 Tag Detection (8 encodings) ---");
+```
+
+**命名规范**：
+
+- 顶层测试标题：`=== TEST <N>: <模式> <输入描述> -> <期望输出> ===`
+- 分区标题：`--- <分区名>: <描述> ---`
+- 子测试标题：`<缩写>: <描述>`（如 `D1: FP16 16ch×1.0 N=1`、`RAND FP16xFP16 seed=0`）
+
+#### 4.5.3 结果验证 Task 模式
+
+##### 模式 A：通用比对 Task（端到端验证）
+
+适用于输出可直接比对期望值的场景：
+
+```verilog
+task check_result;
+    input [31:0] expected;
+    input [255:0] test_name;
+    begin
+        if (result_fp32[31:0] === expected) begin
+            pass_count = pass_count + 1;
+            $display("[PASS] %0s: got=0x%08X, expected=0x%08X", test_name, result_fp32, expected);
+        end else begin
+            fail_count = fail_count + 1;
+            $display("[FAIL] %0s: got=0x%08X, expected=0x%08X", test_name, result_fp32, expected);
+        end
+    end
+endtask
+```
+
+**关键设计点**：
+- 同时打印实际值和期望值的十六进制表示，方便直接比对 bit pattern
+- `[PASS]`/`[FAIL]` 前缀便于日志 grep 筛选
+- 输入参数支持不同位宽的期望值（`input [31:0]`、`input [MANT_PROD_W-1:0]`）
+
+##### 模式 B：Golden Model 比对 Task（中间级验证）
+
+适用于需要软件参考模型计算期望值的场景：
+
+```verilog
+task check_s2_channel;
+    input [5:0]  ch_idx;
+    input string  test_name;
+    reg [MANT_PROD_W-1:0] golden_mant;
+    begin
+        // 用 golden 函数计算期望值
+        golden_mant = golden_mant_prod(mode, phys_a, phys_b, sub);
+        // 逐字段比对
+        if (mant_prod[ch_idx*MANT_PROD_W +: MANT_PROD_W] === golden_mant &&
+            exp_sum[ch_idx*EXP_SUM_W +: EXP_SUM_W] === golden_exp &&
+            sign_prod[ch_idx] === golden_sign) begin
+            pass_count = pass_count + 1;
+        end else begin
+            fail_count = fail_count + 1;
+            $display("  [FAIL] %0s ch=%0d: mant=%0d(golden=%0d) exp=%0d(golden=%0d) sign=%b(golden=%b)",
+                     test_name, ch_idx,
+                     mant_prod[ch_idx*MANT_PROD_W +: MANT_PROD_W], golden_mant,
+                     exp_sum[ch_idx*EXP_SUM_W +: EXP_SUM_W], golden_exp,
+                     sign_prod[ch_idx], golden_sign);
+        end
+    end
+endtask
+```
+
+**关键设计点**：
+- golden （黄金参考）函数与 RTL 逻辑完全对齐，两者独立开发
+- 失败时打印所有差异字段，便于快速定位根因
+- channel 级粒度便于隔离故障通道
+
+##### 模式 C：信号存在性检查
+
+适用于仅需验证信号是否触发（非精确值）的场景：
+
+```verilog
+task check_non_zero;
+    input [2:0]  lane_n;
+    input string test_name;
+    begin
+        if ($signed(tree_sum[CSW*lane_n +: CSW]) != 0 && local_valid[lane_n] === 1'b1) begin
+            pass_count = pass_count + 1;
+            $display("  [PASS] %0s (lane%0d): tree_sum=%0d", test_name, lane_n,
+                     $signed(tree_sum[CSW*lane_n +: CSW]));
+        end else begin
+            fail_count = fail_count + 1;
+            $display("  [FAIL] %0s (lane%0d): tree_sum=%0d, valid=%b",
+                     test_name, lane_n,
+                     $signed(tree_sum[CSW*lane_n +: CSW]), local_valid[lane_n]);
+        end
+    end
+endtask
+```
+
+#### 4.5.4 超时保护模式
+
+每个等待外部信号的循环必须带有超时保护，防止仿真无限挂起：
+
+```verilog
+task wait_out_valid;
+    begin
+        wait_timeout = 0;
+        while (!out_valid && wait_timeout < 50) begin
+            @(posedge clk);
+            wait_timeout = wait_timeout + 1;
+        end
+        if (!out_valid) begin
+            fail_count = fail_count + 1;
+            $display("[FAIL] out_valid not asserted after %0d cycles", wait_timeout);
+        end
+    end
+endtask
+```
+
+**超时阈值选择原则**：
+| 场景 | 推荐阈值 | 说明 |
+|------|---------|------|
+| 单路流水线输出等待 | 30 cycles | 覆盖最坏情况延迟 + 50% 裕量 |
+| 多 PE 级联排空 | 30 cycles | 覆盖级联传播延迟 |
+| 复杂模块输出等待 | 50 cycles | 预留异常情况裕量 |
+| 随机测试批量等待 | 100 cycles | 大量数据注入时放宽 |
+
+#### 4.5.5 调试监控模式
+
+##### 条件触发监控（早期开发阶段）
+
+在开发初期，通过`always @(negedge clk)`加周期范围限制，密集打印关键内部信号：
+
+```verilog
+// ── 开发调试：前 50 个周期密集监控 ──
+always @(negedge clk) begin
+    if (cycle > 0 && cycle <= 50) begin
+        $display("DEBUG cycle=%0d: in_ready=%b in_valid=%b out_valid=%b",
+                 cycle, in_ready, in_valid, out_valid);
+        $display("  pe0 pipe_valid=%b pe1 pipe_valid=%b pe2 pipe_valid=%b pe3 pipe_valid=%b",
+                 u_pe_group.pe_inst[0].u_dp.pipe_valid,
+                 u_pe_group.pe_inst[1].u_dp.pipe_valid,
+                 u_pe_group.pe_inst[2].u_dp.pipe_valid,
+                 u_pe_group.pe_inst[3].u_dp.pipe_valid);
+    end
+end
+```
+
+**使用原则**：
+- 仅在开发早期启用，正式验证时应注释或移除
+- 通过分层打印组织信号：控制信号 → 数据信号 → 状态标志
+- 使用 DUT 层级路径访问内部信号（`u_pe_group.pe_inst[0].u_dp.pipe_valid`）
+
+##### 内联调试打印（定向测试中）
+
+在定向测试 Task 内部直接插入调试打印：
+
+```verilog
+$display("    [S1-debug] nvfp4=0x%h exp_eff_a[ch0]=%0d ext_mant_a[slot0]=11'b%011b",
+         nvfp4_code,
+         exp_eff_a[0 +: EXP_EFF_W],
+         ext_mant_a[0 +: EXT_MANT_W]);
+```
+
+**命名约定**：`[模块名-debug]` 前缀，便于 grep 筛选和事后清理。
+
+#### 4.5.6 随机测试打印规范
+
+随机测试需要记录种子值以便复现：
+
+```verilog
+$display("  [PASS] RAND %0s seed=%0d (lane%0d): tree_sum=%0d, max_exp=%0d",
+         mode_name, seed, lane_n, $signed(tree_sum), golden_max);
+```
+
+- 失败时**必须打印种子值**，否则无法复现
+- 成功时可选择性打印，减少日志量
+- 使用 `$sformatf` 动态构造测试名称
+
+#### 4.5.7 仿真最终汇总
+
+每个测试模块在 `$finish` 前必须输出汇总报告：
+
+```verilog
+$display("============================================");
+$display("  %s Summary: Pass=%0d, Fail=%0d, Total=%0d",
+         test_module_name, pass_count, fail_count, pass_count + fail_count);
+$display("============================================");
+```
+
+**质量标准**：
+- 所有 Testbench 的 `pass_count` 必须等于 `total_count`（fail_count = 0）
+- 不得存在未检测的 PASS/FAIL（所有检查路径必须通过 check task）
+
+#### 4.5.8 波形导出规范
+
+```verilog
+initial begin
+    $dumpfile("build/sim_<module>.vcd");
+    $dumpvars(0, tb_<module>);  // 0=捕获所有层级
+end
+```
+
+- VCD 文件统一输出到 `build/` 目录
+- 命名与 testbench 模块名对应（`sim_pe_group.vcd`）
+- `$dumpvars(0, ...)` 捕获所有层级信号，调试阶段不建议限制层级
+
+#### 4.5.9 调试打印生命周期
+
+```
+开发早期 →
+  条件触发监控 (always @(negedge clk) + cycle 范围)
+  定向测试 + Golden Model 比对
+  ↓
+验证阶段 →
+  移除/注释条件触发监控
+  保留所有 check_* task (定向 + 随机)
+  完整随机测试覆盖
+  ↓
+回归测试 →
+  仅保留 pass/fail 汇总
+  check_* task 内部可省略 PASS 打印（仅打印 FAIL）
+```
+
+#### 4.5.10 实战案例：混合精度点积引擎验证体系
+
+以下数据来自 `dot_product_pipeline` 项目 7 个测试模块的实际验证结果。
+
+##### 测试模块清单
+
+| 模块 | 测试类型 | 覆盖范围 | 打印模式 |
+|------|---------|---------|---------|
+| `tb_pe_group` | 定向 + 随机 | PE 级联流水线全路径 | 模式 A + B + C |
+| `tb_dot_product_pipeline` | 端到端 | 4PE × 多模式，含级联 | 模式 A + 超时 |
+| `tb_s1_spv_format_expand` | 中间级 + 随机 | 7 种格式展开，golden 比对 | 模式 B |
+| `tb_s2_multiplier_array` | 中间级 + 随机 | 288 atom 乘法器阵列 | 模式 B |
+| `tb_s3_align_adder_normalize` | 中间级 | 对齐加法归一化流水线 | 模式 B |
+| `tb_s4_cascade_accum` | 中间级 | 级联累加 + overflow 检测 | 模式 A + C |
+| `tb_nvfp4` | 格式专项 | NVFP4 8 种编码检测 | 模式 B |
+
+##### 验证覆盖率
+
+| 维度 | 覆盖率 | 说明 |
+|------|--------|------|
+| 运算模式 | 7/7 (100%) | FP16×FP16, INT8×INT8, FP8×FP16, FP8×FP8, NVFP4×FP16, NVFP4×FP8, NVFP4×NVFP4 |
+| 通道组合 | 4/8/16/32 | 覆盖 N=1/2/4 正交组合 |
+| 级联路径 | 已覆盖 | cascade_in/out 跨 PE 传播 |
+| 边界条件 | 已覆盖 | subnormal、零值、溢出、最大/最小指数 |
+| 随机种子 | 多组 | 每个模式的定向测试后附加随机回测 |
+
+##### 打印日志量管理策略
+
+- **开发期**：`[DBG]` 前缀 + `always @(negedge clk)` 条件监控，限制 cycle ≤ 50
+- **验证期**：仅 `[PASS]`/`[FAIL]` 打印，`[DBG]` 全部注释
+- **回归期**：`[PASS]` 聚合为计数，仅 `[FAIL]` 详细打印
+- **定位技巧**：`grep FAIL build/sim_*.txt` 一键汇总所有失败项
+
 ---
 
 ## Phase 5: 调试技术
@@ -877,6 +1178,596 @@ sta: syn/output.v
 > - `*.vcd` / `*.lxt` / `*.lxt2` — 波形 dump 文件  
 > - `vvp.tmp` / `.vvp_tmp` — vvp 运行时生成的临时文件  
 > - `*.o` — 如果使用了 C 模型（PLI/VPI 扩展）
+
+### 7.5 SDC/CDC 检查方法学
+
+基于 Yosys + OpenSTA + Verible 工具链的系统化设计检查方法，覆盖 Lint（代码规范）、Synthesis（综合）、STA（静态时序分析）和 CDC（跨时钟域）四个维度。
+
+#### 7.5.1 工具链概览
+
+| 工具 | 用途 | 安装方式 | 输出 |
+|------|------|---------|------|
+| **Verible** | Verilog/SystemVerilog Lint 检查，代码风格与语法规范 | 预编译二进制 `verible-verilog-lint` | Lint 报告（结构化文本） |
+| **Yosys** | RTL 综合、逻辑优化、网表生成 | `apt-get install yosys` | 综合网表 + 面积/时序报告 |
+| **OpenSTA** | 静态时序分析（STA），SDC 约束验证 | 源码编译 / AppImage | 时序违例报告、路径分析 |
+| **Icarus Verilog** | 仿真验证 | `apt-get install iverilog` | VCD 波形 |
+
+**工具版本要求**：
+
+| 工具 | 最低版本 | 推荐版本 | 验证方式 |
+|------|---------|---------|---------|
+| Verible | v0.0-3xxx | v0.0-4071+ | `verible-verilog-lint --version` |
+| Yosys | 0.9 | 0.27+ | `yosys --version` |
+| OpenSTA | 2.2.0 | 2.2.0+ | `sta -version` |
+| Icarus Verilog | 10.0 | 11.0+ | `iverilog -V` |
+
+#### 7.5.2 Verible Lint 检查
+
+##### 基础用法
+
+```bash
+# 单文件检查
+verible-verilog-lint rtl/dut_top.v
+
+# 批量检查（推荐使用 --rules 指定规则集）
+verible-verilog-lint \
+  --rules=-no-tabs,-line-length \
+  rtl/*.v rtl/*.sv
+
+# 项目级检查（生成结构化报告）
+verible-verilog-lint \
+  --ruleset=all \
+  --generate_output \
+  rtl/*.v rtl/*.sv \
+  2>&1 | tee build/lint_report.txt
+```
+
+##### 推荐 Lint 规则集
+
+以下规则集适用于工业级 RTL 设计：
+
+```bash
+# 基础必检规则
+REQUIRED_RULES="\
+  --rules=+module-begin-block \
+  --rules=+explicit-task-return-type \
+  --rules=+explicit-function-return-type \
+  --rules=+always-comb \
+  --rules=+forbidden-macro \
+  --rules=+for-loop-index-word-size \
+  --rules=+generate-label \
+  --rules=+packed-dimensions-range-ordering \
+  --rules=+parameter-name-style \
+  --rules=+undersized-binary-literal \
+  --rules=+unpacked-dimensions-range-ordering \
+  --rules=+v2001-generate-begin \
+  --rules=+genvar-declaration-in-loop"
+
+# 代码风格规则
+STYLE_RULES="\
+  --rules=+no-tabs \
+  --rules=+line-length=120 \
+  --rules=+posix-eof \
+  --rules=+trailing-spaces"
+```
+
+##### Lint 检查流程
+
+```
+Step 1: 准备文件列表 → all_rtl_files.txt
+Step 2: 逐文件 Lint → verible-verilog-lint --ruleset=all rtl/module.v
+Step 3: 分类问题 → Error（必须修复）/ Warning（建议修复）/ Style（风格建议）
+Step 4: 修复 → 按优先级逐一修复，每次修复后重新 Lint 确认
+Step 5: 归档 → 保存 Lint 报告到 build/lint_report.txt
+```
+
+##### 常见 Lint 问题与修复
+
+| 问题 | Verible 规则 | 原因 | 修复 |
+|------|------------|------|------|
+| `generate` 块缺少 label | `generate-label` | 未命名的 generate 块 | 添加 `genvar` 及 `begin : label` |
+| Tab 字符 | `no-tabs` | 混用 Tab 和空格缩进 | 统一为空格缩进 |
+| 文件末尾无换行 | `posix-eof` | POSIX 标准要求 | 文件末尾添加空行 |
+| `always @*` 应改为 `always_comb` | `always-comb` | SV 最佳实践 | 替换为 `always_comb` |
+| 宏定义使用 | `forbidden-macro` | 宏滥用增加调试难度 | 改用 `localparam` / `function` |
+| 二进制常量位宽不足 | `undersized-binary-literal` | `'b1` 未指定位宽 | 改为 `1'b1` |
+
+##### 持续集成集成
+
+```makefile
+# Makefile 片段
+LINT_FILES := $(shell find rtl -name '*.v' -o -name '*.sv')
+
+.PHONY: lint
+lint:
+  @echo "=== Verible Lint Check ==="
+  @verible-verilog-lint --ruleset=all $(LINT_FILES) 2>&1 | tee build/lint_report.txt || true
+  @echo "Lint report saved to build/lint_report.txt"
+```
+
+#### 7.5.3 Yosys 综合检查
+
+##### 基础综合脚本
+
+```tcl
+# syn.ys — Yosys 综合脚本
+# 读取设计文件
+read_verilog -sv params.vh
+read_verilog -sv rtl/dut_top.v
+read_verilog rtl/sub_module.v
+
+# 建立层次结构
+hierarchy -check -top dut_top
+
+# 工艺无关优化流程
+proc; opt; fsm; opt; memory; opt
+
+# 技术映射（使用内置标准单元库）
+techmap; opt
+
+# 报告
+stat
+stat -width
+
+# 写网表
+write_verilog -noattr build/dut_syn.v
+```
+
+##### 命令行执行
+
+```bash
+# WSL 环境
+yosys syn.ys
+
+# 完整综合流程（含 SDC 约束注入）
+yosys -p "
+  read_verilog -sv params.vh rtl/*.v;
+  hierarchy -check -top dot_product_pipeline;
+  proc; opt; fsm; opt;
+  techmap; opt;
+  abc -liberty \$LIBERTY;
+  stat -width;
+  write_verilog build/dut_syn.v
+"
+```
+
+##### 综合质量检查清单
+
+| 检查项 | Yosys 命令 | 通过标准 |
+|--------|-----------|---------|
+| 模块层次完整性 | `hierarchy -check` | 无未解析的模块引用 |
+| Latch 检查 | `proc` 后查看警告 | 无 "found latch" 警告 |
+| 组合逻辑环路检测 | `opt` 后检查 | 无组合环路 |
+| 面积估算 | `stat` | 面积在预期范围内 |
+| 多驱动检查 | `check` | 无多驱动信号 |
+
+##### 常见综合问题
+
+| 问题 | 现象 | 根因 | 修复 |
+|------|------|------|------|
+| 推断出 Latch | `proc` 输出 warning | `always_comb` 中未完整赋值 | 确保所有分支都有赋值 |
+| 未连接输出端口 | `stat` 显示输出为 0 | 未使用的输出未连接 | 添加 `assign` 或确认故意悬空 |
+| 黑盒警告 | `hierarchy` 警告 | 缺少子模块源文件 | 补充子模块 RTL 或设置 `-blackbox` |
+| 组合逻辑环路 | `opt` 报错 | 输出反馈到输入 | 添加寄存器打破环路 |
+
+#### 7.5.4 SDC 时序约束规范
+
+##### SDC 文件结构化模板
+
+```tcl
+# =============================================================================
+# constraints.sdc — 时序约束文件
+# =============================================================================
+
+# ── 参数定义区（便于跨项目复用）──
+set CLK_NAME    clk
+set CLK_PERIOD  5.0          ;# ns（可配置）
+set CLK_PORT    [get_ports $CLK_NAME]
+
+# ── 时钟定义 ──
+create_clock -name $CLK_NAME -period $CLK_PERIOD $CLK_PORT
+
+# ── 时钟不确定性（裕量）──
+set_clock_uncertainty -setup 0.1 [get_clocks $CLK_NAME]
+set_clock_uncertainty -hold  0.05 [get_clocks $CLK_NAME]
+set_clock_transition         0.1 [get_clocks $CLK_NAME]
+
+# ── 输入延迟（外部芯片 → 本模块）──
+set_input_delay  -clock $CLK_NAME -max 1.0 [all_inputs]
+set_input_delay  -clock $CLK_NAME -min 0.5 [all_inputs]
+
+# ── 输出延迟（本模块 → 外部芯片）──
+set_output_delay -clock $CLK_NAME -max 1.0 [all_outputs]
+set_output_delay -clock $CLK_NAME -min 0.5 [all_outputs]
+
+# ── 异步复位处理（作为 false path）──
+set_false_path -from [get_ports rst_n]
+set_false_path -to   [get_ports rst_n]
+
+# ── 异步握手接口（CDC 边界）──
+set_false_path -from [get_ports async_*]
+set_false_path -to   [get_ports async_*]
+```
+
+**约束参数选择指南**：
+
+| 参数 | 推荐值 | 调整原则 |
+|------|-------|---------|
+| `CLK_PERIOD` | 5ns (200MHz) | 根据目标工艺和频率需求调整 |
+| `clock_uncertainty -setup` | period × 2% | 覆盖 skew + jitter，先进工艺取 5% |
+| `clock_uncertainty -hold` | period × 1% | 通常为 setup 裕量的 50% |
+| `clock_transition` | 0.1ns | 技术库默认值的 2 倍 |
+| `input_delay` | period × 20% | 根据外部芯片输出延迟估算 |
+| `output_delay` | period × 20% | 根据外部芯片输入建立时间估算 |
+
+##### 多时钟域约束
+
+```tcl
+# ── 多时钟定义 ──
+create_clock -name clk_core  -period 5.0 [get_ports clk_core]
+create_clock -name clk_mem   -period 3.0 [get_ports clk_mem]
+
+# ── 异步时钟组（独占分析）──
+set_clock_groups -asynchronous \
+  -group [get_clocks clk_core] \
+  -group [get_clocks clk_mem]
+
+# ── 跨时钟域路径约束（双触发器同步器后的边界）──
+# 经过同步器后的路径视为 false path
+set_false_path -from [get_pins sync_reg*/Q] -to [get_pins sync_reg*/D]
+```
+
+#### 7.5.5 OpenSTA 时序分析
+
+##### STA 分析脚本
+
+```tcl
+# sta.tcl — OpenSTA 静态时序分析脚本
+# 读取网表和库
+read_liberty $::env(LIBERTY_FILE)
+read_verilog build/dut_syn.v
+link_design dut_top
+
+# 读取 SDC 约束
+read_sdc constraints/constraints.sdc
+
+# 建立时间检查
+report_checks -path_delay max -slack_lesser_than 0.0
+
+# 保持时间检查
+report_checks -path_delay min -slack_lesser_than 0.0
+
+# 时序总览
+report_tns     ;# 总负裕量
+report_wns     ;# 最差负裕量
+
+# 最差路径报告（Top 10）
+report_checks -path_delay max -slack_lesser_than 0.1 -group_count 10
+
+# 时钟偏移报告
+report_clock_skew
+
+# 退出
+exit
+```
+
+##### 时序质量验收标准
+
+| 指标 | 通过标准 | 说明 |
+|------|---------|------|
+| WNS（最大负裕量）| ≥ 0ns | 最差路径必须满足时序 |
+| TNS（总负裕量）| = 0ns | 不允许任何时序违例 |
+| Setup slack | ≥ 0ns（所有路径）| 建立时间必须满足 |
+| Hold slack | ≥ 0ns（所有路径）| 保持时间必须满足 |
+| 时钟 skew | < 时钟周期 × 5% | 偏移过大需优化时钟树 |
+
+##### 时序违例诊断流程
+
+```
+Step 1: 获取违例路径报告 → report_checks -slack_lesser_than 0.0
+Step 2: 分析关键路径 → 识别 longest path 和 highest fanout
+Step 3: 确定根因：
+  - 组合逻辑过长 → 插入流水线寄存器
+  - 高扇出 → 复制驱动或插入 buffer
+  - 时钟偏移 → 优化时钟树
+  - 约束过严 → 调整 input/output delay
+Step 4: 修复后重新综合 → 重新 STA 验证
+Step 5: 记录修复过程 → 写入 design_notes
+```
+
+#### 7.5.6 CDC 跨时钟域检查
+
+##### CDC 问题分类
+
+| 类别 | 描述 | 解决方案 | 检查方法 |
+|------|------|---------|---------|
+| **单 bit 电平信号** | 慢→快或快→慢时钟域的单 bit 控制信号 | 双触发器同步器 | 人工审查 + `set_false_path` |
+| **多 bit 数据总线** | 跨时钟域的多位数据 | 异步 FIFO / 握手协议 | 人工审查 |
+| **脉冲信号** | 跨时钟域的单周期脉冲 | 脉冲同步器 | 人工审查 |
+| **复位释放** | 异步复位释放的亚稳态风险 | 复位同步器 | `set_false_path` |
+
+##### CDC 约束模板
+
+```tcl
+# ── 识别所有时钟域 ──
+# Step 1: 列出所有时钟
+# create_clock -name clk_A -period X ...
+# create_clock -name clk_B -period Y ...
+
+# Step 2: 声明异步时钟组
+set_clock_groups -asynchronous \
+  -group [get_clocks clk_A] \
+  -group [get_clocks clk_B]
+
+# Step 3: 对同步器输出应用 false path
+# 双触发器同步器模板：
+# always_ff @(posedge clk_B) begin
+#   sync_r1 <= async_signal;  ← 第一级（false path source）
+#   sync_r2 <= sync_r1;       ← 第二级（输出，同步后信号）
+# end
+set_false_path -from [get_pins sync_r1_reg/Q] -to [get_pins sync_r2_reg/D]
+```
+
+##### CDC 人工检查清单
+
+| 检查项 | 描述 | 检查结果 |
+|--------|------|---------|
+| 所有跨时钟域信号是否有同步器 | 每个跨域信号链必须经过 2+ FF | □ |
+| 同步器命名是否规范 | 信号名包含 `sync_` 前缀 | □ |
+| 是否使用 `set_clock_groups` | 所有异步时钟对已声明 | □ |
+| 同步器后路径是否设置 false path | 同步器输出端已约束 | □ |
+| 异步 FIFO 是否正确使用 Gray 码 | 读写指针按 Gray 码传递 | □ |
+| 复位是否跨时钟域 | 如有，需在每个时钟域独立同步 | □ |
+
+#### 7.5.7 完整检查工作流（集成脚本）
+
+```bash
+#!/bin/bash
+# check_all.sh — 完整设计检查流程
+PROJECT_ROOT="/mnt/d/workspace/mixed_precision_dot_product"
+RTL_DIR="$PROJECT_ROOT/rtl"
+TB_DIR="$PROJECT_ROOT/tb"
+BUILD_DIR="$PROJECT_ROOT/build"
+SDC_FILE="$PROJECT_ROOT/constraints/constraints.sdc"
+
+mkdir -p "$BUILD_DIR"
+
+# ── Step 1: Verible Lint ──
+echo "=== [1/4] Verible Lint ==="
+verible-verilog-lint --ruleset=all "$RTL_DIR"/*.v 2>&1 | tee "$BUILD_DIR/lint_report.txt"
+
+# ── Step 2: Icarus Verilog 仿真 ──
+echo "=== [2/4] Simulation ==="
+cd "$TB_DIR"
+iverilog -g2012 -o "$BUILD_DIR/simv" \
+  "$RTL_DIR"/*.v \
+  tb_dot_product_pipeline.v
+vvp "$BUILD_DIR/simv" | tee "$BUILD_DIR/sim_output.txt"
+
+# ── Step 3: Yosys 综合 ──
+echo "=== [3/4] Yosys Synthesis ==="
+yosys -p "
+  read_verilog -sv $RTL_DIR/params.vh;
+  read_verilog $RTL_DIR/*.v;
+  hierarchy -check -top dot_product_pipeline;
+  proc; opt; fsm; opt;
+  techmap; opt;
+  stat -width;
+  write_verilog -noattr $BUILD_DIR/dut_syn.v
+" 2>&1 | tee "$BUILD_DIR/syn_report.txt"
+
+# ── Step 4: OpenSTA 时序分析 ──
+echo "=== [4/4] OpenSTA Timing ==="
+if command -v sta &> /dev/null; then
+  sta -no_splash -exit build/sta_report.txt <<EOF
+read_liberty \$::env(LIBERTY_FILE)
+read_verilog $BUILD_DIR/dut_syn.v
+link_design dot_product_pipeline
+read_sdc $SDC_FILE
+report_checks -path_delay max -slack_lesser_than 0.0
+report_tns
+report_wns
+exit
+EOF
+else
+  echo "[WARNING] OpenSTA not installed. Run: apt install sta"
+fi
+
+# ── 汇总 ──
+echo "=== Design Check Complete ==="
+echo "Reports: $BUILD_DIR/lint_report.txt"
+echo "          $BUILD_DIR/syn_report.txt"
+echo "          $BUILD_DIR/sim_output.txt"
+echo "          $BUILD_DIR/sta_report.txt"
+```
+
+#### 7.5.8 设计签核检查清单
+
+进入物理设计前必须通过的检查项：
+
+| 阶段 | 检查项 | 通过标准 | 工具 |
+|------|--------|---------|------|
+| Lint | 语法/风格 | 0 Error, 可控 Warning | Verible |
+| 仿真 | 功能正确性 | pass_count = total, fail_count = 0 | Icarus / Verilator |
+| 综合 | 可综合 | 无 Latch / 黑盒 / 环路 | Yosys |
+| STA | 时序收敛 | WNS ≥ 0, TNS = 0 | OpenSTA |
+| CDC | 跨时钟域 | 所有异步信号已同步，约束完整 | 人工 + SDC |
+
+#### 7.5.9 Verible Lint 实战分类统计
+
+以下数据来自 `dot_product_pipeline` 项目 7 个 RTL 文件的 Verible 全规则集检查结果（381 条警告）：
+
+| 规则 | 数量 | 严重级别 | 根因 |
+|------|------|---------|------|
+| `port-name-suffix` | 99 | Style | 端口未遵循 `_i/_o` 命名后缀 |
+| `line-length` | 95 | Style | 行宽超过 100 字符 |
+| `explicit-parameter-storage-type` | 80 | Style | `parameter` 未显式声明存储类型 |
+| `explicit-begin` | 39 | Style | `if/for` 后缺少显式 `begin/end` |
+| `unpacked-dimensions-range-ordering` | 26 | Style | 数组维度声明顺序 `[0:N-1]` → 应为 `[N]` |
+| `generate-constructs` (legacy) | 18 | Style | 使用了非 genvar 的旧式 generate |
+| `instance-shadowing` | 10 | Style | 实例名与外层同名 |
+| `always-comb` | 9 | Style | `always @*` → 应为 `always_comb` |
+| `legacy-genvar-declaration` | 9 | Style | `genvar` 在 generate 块外声明 |
+| `legacy-generate-region` | 7 | Style | 遗留 generate region 写法 |
+| `case-missing-default` | 2 | Warning | case 缺少 default 分支 |
+| 其他 | 7 | Style | EOF、trailing spaces 等 |
+
+##### 按修复优先级分类
+
+| 优先级 | 规则 | 数量 | 理由 |
+|--------|------|------|------|
+| **P0（立即）** | `case-missing-default` | 2 | 潜在推断 latch 风险 |
+| **P1（尽快）** | `always-comb` | 9 | 仿真-综合不一致风险 |
+| | `instance-shadowing` | 10 | 层次路径混淆 |
+| **P2（计划）** | `generate-constructs` | 18 | 旧语法可能不被后续工具支持 |
+| | `packed-dimensions-range-ordering` | 26 | 编码规范对齐 |
+| **P3（可选）** | `port-name-suffix` | 99 | 仅影响风格一致性 |
+| | `line-length` | 95 | 不影响功能 |
+| | `explicit-parameter-storage-type` | 80 | 不影响功能 |
+| | `explicit-begin` | 39 | 不影响功能 |
+
+##### Lint 通过标准
+
+- **硬标准**：P0 类问题 = 0；P1 类问题 < 原始数量的 30%
+- **软标准**：P2 类问题可纳入技术债跟踪，逐版本收敛
+- **豁免标准**：P3 类问题在团队风格规范明确前可保留
+
+#### 7.5.10 Yosys 综合限制与 WSL 环境适配
+
+##### WSL 环境内存限制
+
+在 Windows WSL 环境中运行 Yosys 时，复杂设计的 RTLIL 展开可能因内存不足而卡死或崩溃：
+
+- **现象**：Yosys 在 `read_verilog` / `hierarchy` 阶段超时（60s+），WSL pty 崩溃（`灾难性故障 E_UNEXPECTED`）
+- **根因**：WSL 默认使用一半物理内存，大型 always 组合块生成的 RTLIL 网表对象数超标
+- **影响阈值**：以 s2_multiplier_array 为例 — 32 通道 × 288 atom × 多模式展开 ≈ 数百万逻辑对象
+
+##### 解决方案矩阵
+
+| 策略 | 适用场景 | 操作 |
+|------|---------|------|
+| **分模块综合** | 子模块可独立综合 | 按 leaf → branch → top 顺序逐级综合 |
+| **WSL 内存扩容** | 物理内存 ≥ 32GB | 创建 `%UserProfile%\.wslconfig`，设置 `memory=24GB` |
+| **输出重定向** | 抑制终端 I/O 延迟 | `yosys ... > out.txt 2>&1`，将 stderr warnings 重定向 |
+| **timeout 保护** | 防止终端卡死 | `timeout 120 yosys ...` |
+| **Yosys -Q 模式** | 减少输出开销 | 添加 `-Q` 参数抑制 banner 和冗余日志 |
+| **本地 Linux** | 确保资源充足 | 使用物理 Linux 或云 VM（≥16GB RAM） |
+
+##### WSL Yosys 稳定运行命令模板
+
+```bash
+# 推荐：输出到文件 + timeout 保护 + 抑制 stderr
+timeout 180 yosys -Q -p "
+  read_verilog -sv params.vh rtl/*.v;
+  hierarchy -check -top top_module;
+  proc; opt;
+  stat -width;
+  write_verilog build/dut_syn.v
+" > build/syn_full.log 2>&1
+```
+
+##### 工具安装注意事项（WSL）
+
+| 工具 | 安装方式 | 注意事项 |
+|------|---------|---------|
+| Yosys | `apt-get install yosys` | 版本可能较旧（Ubuntu 22.04 = 0.9）；手动编译可获取最新版 |
+| Verible | GitHub Releases 下载预编译二进制 | 不通过 apt 安装；解压后复制到 `/usr/local/bin` |
+| OpenSTA | AppImage 或源码编译 | SWIG >= 4.x 需修改 CMakeLists.txt 移除版本约束 |
+| Icarus | `apt-get install iverilog` | 安装简单，无特殊版本需求 |
+
+#### 7.5.11 变界 for 循环可综合性修复
+
+##### 问题描述
+
+Yosys（以及大多数综合工具）要求 `for` 循环的边界必须为编译期常量。使用变量作为边界的循环会导致综合错误：
+
+```
+"2nd expression of procedural for-loop is not constant"
+"Right hand side of 1st expression of procedural for-loop is not constant"
+```
+
+此限制源自综合工具需要将 for 循环**完全展开**为硬件电路，因此必须预知迭代次数。
+
+##### 修复模式
+
+**修复前（不可综合）**：
+```verilog
+// active 是运行时变量 → 循环边界不固定
+for (ch = 0; ch < active; ch = ch + 1) begin
+    ext_mant_a[EXT_MANT_W*ch +: EXT_MANT_W] = ...;
+end
+```
+
+**修复后（可综合）**：
+```verilog
+// 定义编译期常量作为最大边界
+localparam MAX_PARALLEL = 32;
+
+// 使用常量边界 → 工具在编译期确定迭代次数
+for (ch = 0; ch < MAX_PARALLEL; ch = ch + 1) begin
+    if (ch < active) begin  // 运行时条件：仅活跃通道执行
+        ext_mant_a[EXT_MANT_W*ch +: EXT_MANT_W] = ...;
+    end
+end
+```
+
+##### 本项目修复清单
+
+| 文件 | 修复位置 | 变量边界 | 替换为 | 修复行数 |
+|------|---------|---------|--------|---------|
+| `s1_spv_format_expand.v` | channel 遍历 | `active` | `MAX_PARALLEL` + `if (ch < active)` | 1 |
+| `s3_align_adder_normalize.v` | max_exponent 扫描 ×2 | `active_parallel` | `MAX_PARALLEL` + `if (ch < active_parallel)` | 2 |
+| `s2_multiplier_array.v` | n_position 遍历 | `N_lane` | `MAX_N` + `if (n_position < N_lane)` | 1 |
+| `s2_multiplier_array.v` | 高通道清零 | `K_LANES * N_lane` (start) | `0` + `if (ch >= K_LANES * N_lane)` | 1 |
+| `s2_multiplier_array.v` | a_slice/b_slice 遍历 | `fn_a_slices`/`fn_b_slices` | `MAX_A_SLICES`/`MAX_B_SLICES` + 条件 | 4 |
+
+##### 设计规则
+
+> **所有综合目标 for 循环必须使用 `localparam` 常量作为边界**。运行时变量差异通过循环体内的 `if` 条件分支处理。新增常量定义统一放置在模块参数声明区，以 `MAX_` 前缀命名以便识别。
+
+#### 7.5.12 综合警告诊断：范围越界
+
+##### 警告特征
+
+```
+Warning: Range select [694:693] out of bounds on signal `\ext_mant_a_unpacked':
+Setting all 2 result bits to undef.
+```
+
+##### 诊断三步法
+
+**Step 1: 定位**。识别警告涉及的信号和越界偏移量：
+- 信号名：`ext_mant_a_unpacked`
+- 越界范围：`[694:693]`
+- 信号声明位宽：`[EXT_MANT_W * MAX_PARALLEL - 1:0]` = `[351:0]`
+
+**Step 2: 分析**。追踪越界访问的生成逻辑：
+```verilog
+// NVFP4_FP16 模式下，slot=15 时的展开偏移
+ext_mant_a_unpacked[EXT_MANT_W*(4*slot+3) +: 2]  // → [694:693]
+// EXT_MANT_W=11, slot=15 → 11*(60+3)+1 = 694
+```
+根因：NVFP4 展开率 4×（每个物理槽位包含 4 个逻辑元素），但 `ext_mant_a_unpacked` 的位宽仅按 `物理槽位数 × 尾数宽` 分配，未考虑最大展开倍数。
+
+**Step 3: 修复**。重新计算所需位宽：
+```verilog
+// 修复前
+wire [EXT_MANT_W * MAX_PARALLEL - 1:0] ext_mant_a_unpacked; // 352 bits
+
+// 修复后：考虑最大展开率
+localparam MAX_UNPACK_RATIO = 4;  // NVFP4 最多 4 个元素/槽位
+wire [EXT_MANT_W * MAX_PARALLEL * MAX_UNPACK_RATIO / 2 - 1:0]
+     ext_mant_a_unpacked;          // 704 bits
+```
+
+##### 通用诊断原则
+
+| 警告类型 | 诊断方法 | 修复策略 |
+|---------|---------|---------|
+| range select out of bounds | 对比信号声明位宽与访问偏移 | 扩容信号位宽或限制访问范围 |
+| inferred latch | 检查 case/if 完整性 | 补全 else/default 分支 |
+| multi-driver | 查 grep `信号名` 的 assign/always 源 | 合并到单一 always 块 |
+| blackbox | `hierarchy -check` 未解析 | 补充子模块源文件或 `-blackbox` 声明 |
 
 ---
 
