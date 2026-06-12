@@ -1,0 +1,41 @@
+{
+  "mcpServers": {
+    "computer-use": {
+      "command": "uvx",
+      "args": ["computer-use-mcp"]
+    },
+    "context7": {
+      "command": "npx",
+      "args": ["-y", "@upstash/context7-mcp@latest"],
+      "env": {},
+      "fromGalleryId": "byted-mcp-volcengine.context7"
+    },
+    "pdf-reader-mcp": {
+      "command": "npx",
+      "args": ["@sylphlab/pdf-reader-mcp"],
+      "env": {},
+      "fromGalleryId": "byted-mcp-volcengine.pdf-reader-mcp"
+    },
+    "trae-mem": {
+      "cwd": "<USER_HOME>/.trae-mem",
+      "args": ["<USER_HOME>/.trae-mem/dist/mcp/server.js"],
+      "command": "node"
+    },
+    "anysearch": {
+      "url": "https://api.anysearch.com/mcp",
+      "headers": {
+        "Authorization": "Bearer <YOUR_ANYSEARCH_API_KEY>"
+      }
+    },
+    "mcd-mcp": {
+      "url": "https://mcp.mcd.cn",
+      "headers": {
+        "Authorization": "Bearer <YOUR_MCD_API_KEY>"
+      }
+    },
+    "gbrain": {
+      "command": "gbrain",
+      "args": ["serve"]
+    }
+  }
+}

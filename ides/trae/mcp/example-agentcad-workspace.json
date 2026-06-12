@@ -1,0 +1,9 @@
+{
+  "mcpServers": {
+    "agentcad": {
+      "command": "python",
+      "args": ["-m", "agentcad.mcp"],
+      "cwd": "d:\\workspace\\agentcad"
+    }
+  }
+}
