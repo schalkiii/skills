@@ -14,11 +14,8 @@
 skills/
 ├── ides/                          # 各 IDE 特有配置
 │   └── trae/                      # Trae IDE
-│       ├── mcp/                   # MCP 服务器配置
-│       │   ├── global-mcp.json    # 用户级 MCP（脱敏模板）
-│       │   └── example-agentcad-workspace.json  # 项目级 MCP 示例
-│       └── rules/                 # 规则配置
-│           └── user_rules.md      # 用户全局规则模板
+│       ├── mcp/                   # MCP 服务器配置备份
+│       └── rules/                 # 规则配置备份
 ├── skills/                        # 124 个可迁移的 Agent 技能
 │   ├── agent-browser/
 │   ├── lark-base/
@@ -37,17 +34,17 @@ skills/
 
 ### Rules（规则）
 
-| IDE                          | 规则文件路径                                                        | 格式                               | 特殊机制                                                                                     |
-| ---------------------------- | ------------------------------------------------------------------- | ---------------------------------- | -------------------------------------------------------------------------------------------- |
-| **Trae**（字节跳动）         | `.trae/rules/*.md`（项目级）<br>Settings > Rules > Global（用户级） | Markdown                           | 支持 4 种生效模式：`alwaysApply`、`globs` 匹配文件、`description` 智能判断、`#Rule` 手动引用 |
-| **Cursor**                   | `.cursor/rules/*.mdc`                                               | MDC（YAML Frontmatter + Markdown） | Frontmatter 字段：`description`、`globs`、`alwaysApply`；支持多文件规则                      |
-| **Windsurf**（Codeium）      | `.windsurfrules`（项目根目录）                                      | 纯文本（单文件）                   | 所有规则合并为单一文件                                                                       |
-| **GitHub Copilot**           | `.github/copilot-instructions.md`                                   | Markdown（单文件）                 | 仅单文件，所有规则集中                                                                       |
-| **CodeBuddy**（腾讯）        | `.codebuddy/rules/*.md`                                             | Markdown                           | 与 Trae 格式类似                                                                             |
-| **Lingma**（阿里）           | `.lingma/rules/*.md`                                                | Markdown                           | 支持 HTML 注释元数据                                                                         |
-| **Claude Code**（Anthropic） | `CLAUDE.md`（项目根目录）                                           | Markdown（单文件）                 | 单文件项目指导                                                                               |
-| **Gemini CLI**（Google）     | `GEMINI.md`（项目根目录）                                           | Markdown（单文件）                 | 单文件项目指导                                                                               |
-| **VS Code**（通用）          | `.vscode/rules/*.md`                                                | Markdown                           | 标准 Markdown 格式                                                                           |
+| IDE                          | 规则文件路径                                                                                                                        | 格式                               | 特殊机制                                                                                       |
+| ---------------------------- | ----------------------------------------------------------------------------------------------------------------------------------- | ---------------------------------- | ---------------------------------------------------------------------------------------------- |
+| **Trae**（字节跳动）         | 项目级：`.trae/rules/*.md`<br>全局级：`AppData/Roaming/Trae CN/User/globalStorage/` 下的 state.vscdb 中，通过 Settings > Rules 管理 | Markdown                           | 项目级支持 4 种生效模式（见下文）；全局级规则对所有项目生效，格式为纯 Markdown，无 Frontmatter |
+| **Cursor**                   | `.cursor/rules/*.mdc`                                                                                                               | MDC（YAML Frontmatter + Markdown） | Frontmatter 字段：`description`、`globs`、`alwaysApply`；支持多文件规则                        |
+| **Windsurf**（Codeium）      | `.windsurfrules`（项目根目录）                                                                                                      | 纯文本（单文件）                   | 所有规则合并为单一文件                                                                         |
+| **GitHub Copilot**           | `.github/copilot-instructions.md`                                                                                                   | Markdown（单文件）                 | 仅单文件，所有规则集中                                                                         |
+| **CodeBuddy**（腾讯）        | `.codebuddy/rules/*.md`                                                                                                             | Markdown                           | 与 Trae 格式类似                                                                               |
+| **Lingma**（阿里）           | `.lingma/rules/*.md`                                                                                                                | Markdown                           | 支持 HTML 注释元数据                                                                           |
+| **Claude Code**（Anthropic） | `CLAUDE.md`（项目根目录）                                                                                                           | Markdown（单文件）                 | 单文件项目指导                                                                                 |
+| **Gemini CLI**（Google）     | `GEMINI.md`（项目根目录）                                                                                                           | Markdown（单文件）                 | 单文件项目指导                                                                                 |
+| **VS Code**（通用）          | `.vscode/rules/*.md`                                                                                                                | Markdown                           | 标准 Markdown 格式                                                                             |
 
 ### MCP（Model Context Protocol）
 
@@ -70,7 +67,29 @@ skills/
 
 ## Trae 配置详解
 
-### Trae Rules 生效模式
+### Trae 全局规则（Global Rules）
+
+Trae 支持用户级全局规则，对所有项目生效，无需每个项目重复配置。
+
+**配置方式**：Settings > Rules > Create > Global
+
+**存储位置**：`AppData/Roaming/Trae CN/User/globalStorage/` 下的 state.vscdb（leveldb 格式），不可直接编辑文件，只能通过 Trae 设置界面管理。
+
+**适用场景**：
+
+- 语言偏好（始终用中文回复）
+- 交互模式（批量提问、直接回答）
+- 操作系统偏好（Windows/macOS）
+- 内容深度（简洁 vs 详细）
+- 通用编程习惯
+
+**与项目规则的关系**：
+
+- 全局规则在所有项目中生效，作为基础行为规范
+- 项目规则（`.trae/rules/*.md`）仅在当前项目生效，定义项目特定规范
+- 两者同时存在时，项目规则优先级更高，但全局规则始终会被加载
+
+### Trae 项目规则生效模式
 
 Trae 的项目规则支持 4 种生效模式：
 
@@ -311,14 +330,13 @@ git clone <repo-url> ~/.ai-ide-config
 # Trae 用户：软链接 skills
 ln -s ~/.ai-ide-config/skills/* ~/.trae/skills/
 
-# Trae 用户：软链接 MCP 配置（按需编辑）
+# Trae 用户：配置 MCP（参考 ides/trae/mcp/ 中的配置）
 cp ~/.ai-ide-config/ides/trae/mcp/global-mcp.json ~/.trae/mcp.json
 
-# Trae 用户：软链接规则
-cp ~/.ai-ide-config/ides/trae/rules/user_rules.md <对应路径>
+# Trae 用户：导入规则（参考 ides/trae/rules/ 中的配置）
 ```
 
 ## 安全提醒
 
-- `ides/trae/mcp/global-mcp.json` 中的 API 密钥已脱敏为占位符（`<YOUR_XXX>`），使用前需替换为真实值
+- MCP 配置中的 API 密钥需替换为真实值后再使用
 - 不要将包含真实密钥的配置文件提交到仓库
